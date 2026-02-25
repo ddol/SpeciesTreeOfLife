@@ -37,6 +37,7 @@
 | G5 | Optional ability to load a second/newer "reference database" (user-provided file, or optional explicit download). |
 | G6 | **Species comparison**: show taxonomic distance + explanatory path + **top-N closest relatives**. |
 | G7 | Consistent SwiftUI rendering across platforms with minimal platform shims. |
+| G8 | **Local-only favourites**: users can save species to a private on-device favourites list. No PII stored; no sync or remote storage. |
 
 ---
 
@@ -61,6 +62,7 @@
 - **View detail pages**: images, traits, habitat, conservation status, references/citations.
 - **Compare** two species: taxonomic distance, shared ancestor path, trait deltas.
 - **Discover top-N closest relatives** to any species.
+- **Favourite** species to a private local list; view, reorder, and clear favourites at any time.
 
 The primary target audience is children and students; the UX must be safe, ad-free, and require no account.
 
@@ -130,6 +132,21 @@ If the app offers an optional "download newer reference DB" feature (future mile
 | Diagnostics | No | No remote crash/performance reporting. |
 
 **Result:** "No Data Collected" declaration on the App Store privacy label.
+
+### 4.6 Favourites Privacy
+
+Favourites are stored **entirely on-device** in a dedicated SQLite file (`favorites.sqlite`) inside the app's Application Support sandbox. The following invariants hold:
+
+| Property | Detail |
+|---|---|
+| What is stored | `taxon_id` (opaque `INTEGER` database key) + `created_at` (ISO-8601 timestamp). Nothing else. |
+| What is NOT stored | Any user identifier, device ID, name, account, IP address, or behavioural profile. |
+| Is `taxon_id` PII? | No. It is a species database key (e.g., `12345` = *Panthera leo*). It cannot identify a person. |
+| Is `created_at` PII? | No, by itself. A sequence of timestamps in isolation cannot identify a person. The data never leaves the device. |
+| Network transmission | Never. Favourites are strictly local. |
+| iCloud backup | Allowed by default (standard OS backup is encrypted and belongs to the user). The favourites file is **not** enrolled in iCloud Drive or CloudKit sync — no server ever receives it from us. |
+| User control | Users can delete individual favourites or wipe all favourites from Settings → Favourites → Clear All. The operation is immediate and permanent. |
+| Export | "Export Favourites" (user-initiated) produces a plain-text list of species names — no timestamps, no IDs. Presented via the OS share sheet; destination is the user's choice. |
 
 ---
 
@@ -228,14 +245,14 @@ See §6 and §10.
 │  │   AppCoordinator · DI Container · Navigation Router    │    │
 │  └─┬──────────┬─────────────┬─────────────┬──────────────┘    │
 │    │          │             │             │                     │
-│  ┌─▼──────┐ ┌─▼──────────┐ ┌▼──────────┐ ┌▼─────────────┐   │
-│  │STOLData│ │STOLSearch  │ │STOLCompare│ │STOLMedia     │   │
-│  │        │ │            │ │           │ │              │   │
-│  │· DB    │ │· FTS engine│ │· LCA      │ │· MediaCache  │   │
-│  │  actor │ │· Fuzzy     │ │· Top-N    │ │  actor       │   │
-│  │· Schema│ │· Rank flt. │ │· Trait    │ │· Pack loader │   │
-│  │· Import│ │            │ │  similarity│ │              │   │
-│  └─┬──────┘ └────────────┘ └───────────┘ └──────────────┘   │
+│  ┌─▼──────┐ ┌─▼──────────┐ ┌▼──────────┐ ┌▼─────────────┐ ┌▼────────────┐  │
+│  │STOLData│ │STOLSearch  │ │STOLCompare│ │STOLMedia     │ │STOLFavorites│  │
+│  │        │ │            │ │           │ │              │ │             │  │
+│  │· DB    │ │· FTS engine│ │· LCA      │ │· MediaCache  │ │· Favorites  │  │
+│  │  actor │ │· Fuzzy     │ │· Top-N    │ │  actor       │ │  actor      │  │
+│  │· Schema│ │· Rank flt. │ │· Trait    │ │· Pack loader │ │· Local SQLite│ │
+│  │· Import│ │            │ │  similarity│ │              │ │  (no PII)   │  │
+│  └─┬──────┘ └────────────┘ └───────────┘ └──────────────┘ └─────────────┘  │
 │    │                                                           │
 │  ┌─▼──────────────────────┐                                   │
 │  │  STOLSharedUI          │  (SwiftUI views shared by both    │
@@ -244,11 +261,12 @@ See §6 and §10.
 │  │  · SearchView          │                                   │
 │  │  · SpeciesDetail       │                                   │
 │  │  · CompareView         │                                   │
+│  │  · FavouritesView      │                                   │
 │  │  · SettingsView        │                                   │
 │  └────────────────────────┘                                   │
 └─────────────────────────────────────────────────────────────────┘
 
-Dependency direction: Targets → AppCore → Data/Search/Compare/Media
+Dependency direction: Targets → AppCore → Data/Search/Compare/Media/Favorites
                       SharedUI → AppCore (protocols only)
                       No circular dependencies.
 ```
@@ -392,6 +410,35 @@ CREATE VIRTUAL TABLE fts_taxa USING fts5(
     content='',          -- contentless FTS for lower storage; rebuilt by pipeline
     tokenize='unicode61 remove_diacritics 2'
 );
+```
+
+### 7.8 `favorites` Table
+
+Stored in a **separate** `favorites.sqlite` file (Application Support), not in the taxonomy DB. This keeps favourites independent of taxonomy DB switching and avoids any write access to the read-only taxonomy DBs.
+
+```sql
+-- Privacy note: only opaque taxon IDs and creation timestamps are stored.
+-- No user identifiers, no device IDs, no PII of any kind.
+CREATE TABLE favorites (
+    taxon_id    INTEGER PRIMARY KEY,   -- opaque species DB key; not a user identifier
+    created_at  TEXT NOT NULL          -- ISO-8601 UTC; used for "most recently added" ordering only
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+-- Supports ordered retrieval by recency.
+CREATE INDEX idx_favorites_created ON favorites(created_at DESC);
+```
+
+**Storage characteristics:**
+
+| Property | Value |
+|---|---|
+| File location | `<Application Support>/Favorites/favorites.sqlite` |
+| Open flags | `SQLITE_OPEN_READWRITE \| SQLITE_OPEN_CREATE` |
+| Max expected rows | Unbounded; practically < 10 000 for a typical user |
+| Size per row | ~30 bytes → 10 000 favourites ≈ 300 KB |
+| iCloud backup | Yes (standard OS backup; no app-level sync) |
+| Excluded from iCloud Drive | Yes (not enrolled in CloudKit or iCloud Drive) |
 ```
 
 ---
@@ -750,6 +797,53 @@ public struct TaxonReference: Sendable {
 }
 ```
 
+### 10.8 `FavoritesService` Protocol
+
+```swift
+/// Local-only, privacy-safe favourites storage.
+///
+/// Privacy guarantees (enforced by design, not just policy):
+/// - Stores only opaque taxon IDs and creation timestamps.
+/// - No user identifier, device ID, or any PII is stored or derivable.
+/// - Data never leaves the device (no network calls, no CloudKit sync).
+/// - All data is user-deletable on demand.
+public protocol FavoritesService: AnyObject, Sendable {
+    /// Returns true if the taxon is currently marked as a favourite.
+    func isFavourite(taxonID: TaxonID) async -> Bool
+
+    /// Add a taxon to favourites. No-op if already favourited.
+    func addFavourite(taxonID: TaxonID) async throws
+
+    /// Remove a taxon from favourites. No-op if not favourited.
+    func removeFavourite(taxonID: TaxonID) async throws
+
+    /// Toggle favourite status. Returns the new favourite state (true = now favourited).
+    @discardableResult
+    func toggleFavourite(taxonID: TaxonID) async throws -> Bool
+
+    /// All favourited taxon IDs, ordered by most recently added first.
+    func allFavourites() async throws -> [FavouriteEntry]
+
+    /// Total number of favourited taxa.
+    func favouritesCount() async throws -> Int
+
+    /// Permanently delete all favourites. Requires explicit call; no accidental trigger.
+    func clearAllFavourites() async throws
+
+    /// Approximate on-disk size of the favourites database in bytes.
+    func storageBytes() async throws -> Int64
+}
+
+/// A single favourite record. Contains no PII.
+public struct FavouriteEntry: Identifiable, Sendable {
+    public var id: TaxonID { taxonID }
+    /// Opaque species database key. Not a user identifier.
+    public let taxonID: TaxonID
+    /// When the species was favourited. Used for ordering only; never transmitted or logged.
+    public let createdAt: Date
+}
+```
+
 ---
 
 ## 11. UI Structure
@@ -783,6 +877,7 @@ macOS:      NavigationSplitView with three columns (tree / list / detail)
 ### 11.4 Species Detail (`SpeciesDetailView`)
 
 - Header: scientific name (italic), preferred common name, rank badge, conservation badge.
+- **Favourite button** (heart/star icon, top-right of header): toggles favourite status immediately via `FavoritesService.toggleFavourite`. Filled icon = favourited; outline = not favourited. No confirmation required for add; swipe-to-delete or long-press available in FavouritesView.
 - Image (from `MediaCache`; placeholder if unavailable).
 - Taxonomy path (breadcrumb): Domain → … → Genus → **Species** (tappable).
 - Traits section (collapsible): key-value grid.
@@ -812,7 +907,32 @@ macOS:      NavigationSplitView with three columns (tree / list / detail)
 
 Species pickers use `SearchView` in a sheet. Results update when either species changes.
 
-### 11.6 Settings (`SettingsView`)
+### 11.6 Favourites View (`FavouritesView`)
+
+Accessible from the main tab bar / sidebar as a top-level destination.
+
+```
+┌────────────────────────────────────────────────────────┐
+│  ♥ Favourites                         [Edit] [Share]   │
+├────────────────────────────────────────────────────────┤
+│  [Species image]  Panthera leo                         │
+│                   Lion · Species · LC                  │
+├────────────────────────────────────────────────────────┤
+│  [Species image]  Quercus robur                        │
+│                   English Oak · Species · LC           │
+│  …                                                     │
+├────────────────────────────────────────────────────────┤
+│  12 species  ·  Sorted: Most recently added ▾          │
+└────────────────────────────────────────────────────────┘
+```
+
+- **Sort options:** Most recently added (default), A–Z by scientific name, A–Z by common name.
+- **Swipe to delete** (iOS) / right-click → Remove (macOS): removes individual favourite immediately. No confirmation needed (the action is easily reversible by re-favouriting).
+- **Edit mode:** Multi-select delete.
+- **Share:** Exports a plain-text list of species names (no taxon IDs, no timestamps). Uses `UIActivityViewController` / `NSSharingServicePicker`. User controls destination.
+- **Empty state:** Friendly illustration + "Tap ♥ on any species to save it here."
+
+### 11.7 Settings (`SettingsView`)
 
 ```
 Settings
@@ -821,6 +941,10 @@ Settings
   ├── Data & Privacy
   │     "We collect no data." (plain language summary)
   │     Data sources: bundled DB version + reference DB version (if active)
+  ├── Favourites
+  │     Favourites count: N species saved
+  │     [Export Favourites…]   (share sheet; exports names only, no IDs/timestamps)
+  │     [Clear All Favourites] (destructive; confirmation required)
   ├── Database
   │     Active database (bundled / reference)
   │     [Import Reference Database…]
@@ -828,6 +952,7 @@ Settings
   ├── Storage
   │     Bundled DB: X MB (not deletable)
   │     Reference DB: X MB (deletable)
+  │     Favourites DB: X KB (deletable via Clear All above)
   │     Media packs: list with delete buttons
   │     [Export Diagnostics] (debug builds only or always-visible in Settings)
   └── Developer  (Debug builds only)
@@ -950,6 +1075,8 @@ public struct CompareConfig: Sendable {
 | Licensing of species data | Medium | High | Use CC0 or CC BY datasets (GBIF, Open Tree of Life). Document all data licenses in Settings → About → Data Sources. |
 | FTS5 index rebuild time on large DB | Low | Low | FTS index pre-built in offline pipeline; no rebuild on device. |
 | macOS notarization / hardened runtime | Low | Medium | SQLite file access requires no special entitlements when within app sandbox. Use app sandbox for both platforms. |
+| Favourites DB corruption on unexpected termination | Low | Low | GRDB uses WAL mode + SQLite's built-in rollback journal; uncommitted writes are never visible. On next launch, integrity_check is run and the file is re-created empty if corrupt (favourites are user-restorable by re-tapping). |
+| Favourites misidentified as behavioural tracking | Low | Medium | Documented clearly in §4.6 and Settings → Data & Privacy. The data is opaque IDs only, never transmitted, and fully user-deletable. App Store label remains "No Data Collected". |
 
 ---
 
@@ -971,9 +1098,11 @@ public struct CompareConfig: Sendable {
 - [ ] Complete tree browser with all ranks.
 - [ ] Full search: common names, synonyms, rank filter, autocomplete.
 - [ ] Species detail with bundled images (asset catalog or bundle).
+- [ ] **Favourites**: heart button on Species Detail; FavouritesView tab; sort + share + clear-all.
+- [ ] **Favourites privacy**: favourites stored in dedicated local SQLite; documented in Settings → Data & Privacy.
 - [ ] Privacy settings screen (data practices explanation).
-- [ ] Storage management screen.
-- [ ] Unit tests: taxonomy store, search.
+- [ ] Storage management screen (includes favourites storage size + clear action).
+- [ ] Unit tests: taxonomy store, search, favourites (add/remove/toggle/clear/export).
 - [ ] Performance tests passing: cold start < 2 s, search < 100 ms.
 - [ ] App Store ready: privacy label, no permissions.
 
@@ -1042,6 +1171,10 @@ SpeciesTreeOfLife-/            ← repository root (trailing hyphen is the repo 
 │   │   ├── Package.swift
 │   │   ├── Sources/STOLImport/
 │   │   └── Tests/STOLImportTests/
+│   ├── STOLFavorites/                    ← FavoritesService, local SQLite (no PII)
+│   │   ├── Package.swift
+│   │   ├── Sources/STOLFavorites/
+│   │   └── Tests/STOLFavoritesTests/
 │   └── STOLSharedUI/                     ← SwiftUI views
 │       ├── Package.swift
 │       ├── Sources/STOLSharedUI/
@@ -1063,10 +1196,12 @@ STOLSharedUI  ──────► STOLData
                   └──► STOLSearch
                   └──► STOLCompare
                   └──► STOLMedia
+                  └──► STOLFavorites
 
 STOLSearch   ──────► STOLData
 STOLCompare  ──────► STOLData
 STOLImport   ──────► STOLData
+STOLFavorites ─────► STOLData (for TaxonID type only; owns its own favorites.sqlite)
 STOLMedia    ──────► STOLData (for TaxonID type)
 
 External deps (STOLData only):
@@ -1233,6 +1368,129 @@ public final class ImportServiceImpl: ImportService {
 }
 ```
 
+**`STOLFavorites/Sources/STOLFavorites/FavoritesServiceImpl.swift`**
+
+```swift
+import Foundation
+import STOLData
+
+/// Privacy-safe, local-only favourites storage.
+///
+/// Uses a dedicated GRDB DatabaseQueue backed by favorites.sqlite in Application Support.
+/// The only data stored is (taxon_id INTEGER, created_at TEXT). No PII is stored or derivable.
+public actor FavoritesServiceImpl: FavoritesService {
+
+    // MARK: - Private state
+
+    private let db: DatabaseQueue   // GRDB.swift DatabaseQueue (favorites.sqlite)
+
+    // In-memory set for O(1) isFavourite checks without hitting disk.
+    private var cachedIDs: Set<TaxonID> = []
+
+    // MARK: - Initialisation
+
+    public init(appSupportURL: URL) throws {
+        let dir = appSupportURL.appendingPathComponent("Favorites", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dbURL = dir.appendingPathComponent("favorites.sqlite")
+        self.db = try DatabaseQueue(path: dbURL.path)
+        try db.write { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS favorites (
+                    taxon_id    INTEGER PRIMARY KEY,
+                    created_at  TEXT NOT NULL
+                        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_favorites_created
+                    ON favorites(created_at DESC);
+                """)
+        }
+        // Warm the in-memory cache.
+        let ids = try db.read { db in
+            try Int64.fetchAll(db, sql: "SELECT taxon_id FROM favorites")
+        }
+        self.cachedIDs = Set(ids)
+    }
+
+    // MARK: - FavoritesService
+
+    public func isFavourite(taxonID: TaxonID) -> Bool {
+        cachedIDs.contains(taxonID)
+    }
+
+    public func addFavourite(taxonID: TaxonID) throws {
+        guard !cachedIDs.contains(taxonID) else { return }
+        try db.write { db in
+            try db.execute(
+                sql: "INSERT OR IGNORE INTO favorites (taxon_id) VALUES (?)",
+                arguments: [taxonID]
+            )
+        }
+        cachedIDs.insert(taxonID)
+    }
+
+    public func removeFavourite(taxonID: TaxonID) throws {
+        guard cachedIDs.contains(taxonID) else { return }
+        try db.write { db in
+            try db.execute(
+                sql: "DELETE FROM favorites WHERE taxon_id = ?",
+                arguments: [taxonID]
+            )
+        }
+        cachedIDs.remove(taxonID)
+    }
+
+    @discardableResult
+    public func toggleFavourite(taxonID: TaxonID) throws -> Bool {
+        if cachedIDs.contains(taxonID) {
+            try removeFavourite(taxonID: taxonID)
+            return false
+        } else {
+            try addFavourite(taxonID: taxonID)
+            return true
+        }
+    }
+
+    public func allFavourites() throws -> [FavouriteEntry] {
+        try db.read { db in
+            // Fetch rows ordered by most recently added first.
+            // No PII in the result: only taxon IDs and timestamps.
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT taxon_id, created_at
+                  FROM favorites
+                 ORDER BY created_at DESC
+                """)
+            return rows.compactMap { row -> FavouriteEntry? in
+                guard let id: TaxonID = row["taxon_id"],
+                      let iso: String = row["created_at"],
+                      let date = ISO8601DateFormatter().date(from: iso)
+                else { return nil }
+                return FavouriteEntry(taxonID: id, createdAt: date)
+            }
+        }
+    }
+
+    public func favouritesCount() throws -> Int {
+        cachedIDs.count
+    }
+
+    public func clearAllFavourites() throws {
+        try db.write { db in
+            try db.execute(sql: "DELETE FROM favorites")
+        }
+        cachedIDs.removeAll()
+    }
+
+    public func storageBytes() throws -> Int64 {
+        try db.read { db in
+            let pageCount = try Int64.fetchOne(db, sql: "PRAGMA page_count") ?? 0
+            let pageSize  = try Int64.fetchOne(db, sql: "PRAGMA page_size")  ?? 4096
+            return pageCount * pageSize
+        }
+    }
+}
+```
+
 ---
 
 ## Appendix A: Data Licenses
@@ -1263,3 +1521,4 @@ The following open datasets are candidates for the bundled species database:
 | STOL | Short for "Species Tree of Life" — used as Swift package name prefix. |
 | Bundled DB | The SQLite database shipped inside the app bundle; always present; never modified. |
 | Reference DB | An optional secondary SQLite database imported by the user; can be enabled/disabled/deleted. |
+| Favourites DB | A small local SQLite file (`favorites.sqlite`) that stores only opaque taxon IDs and timestamps. No PII. Never transmitted. |

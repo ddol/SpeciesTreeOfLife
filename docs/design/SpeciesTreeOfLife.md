@@ -4,6 +4,11 @@
 **Date:** 2026-02-24  
 **Audience:** iOS/macOS engineers, data engineers, product, App Store review  
 
+**Related Documentation:**
+- [Visual Design Spec](VisualDesign.md) — colour system, typography, shape language, motion, SwiftUI tokens
+- [Data Loading Spec](DataLoading.md) — DB format, pipeline, import/validation, search indexing
+- [Favourites Feature Spec](Favorites.md) — privacy-safe local favourites: schema, service API, UI, risks
+
 ---
 
 ## Table of Contents
@@ -80,7 +85,7 @@ For this app, PII includes (but is not limited to): name, email, device ID, adve
 
 | Permission | Status | Justification |
 |---|---|---|
-| Network / Internet | **None by default.** Optional, explicit, user-initiated only. | See §4.3. |
+| Network / Internet (app networking behaviour) | **No networking features in v1 on iOS/iPadOS. No macOS network sandbox entitlements requested in v1.** Any future download/sync feature is gated behind an explicit in-app setting — not an OS permission prompt. | See §4.3. |
 | Location (precise) | **Never requested.** | Non-goal; prohibited. |
 | Location (coarse) | **Never requested.** | Same. |
 | Contacts | **Never requested.** | Non-goal. |
@@ -103,7 +108,7 @@ If the app offers an optional "download newer reference DB" feature (future mile
 4. **No tracking identifiers.** Requests must not include IDFA, IDFV, device serial, or any per-user token.
 5. **HTTPS only** with certificate pinning (or App Transport Security default; no ATS exceptions).
 6. **Checksum verification** of downloaded file before use (see §9).
-7. The network permission key (`NSAppTransportSecurity`, entitlements) must be absent from the Info.plist for builds where the feature is disabled.
+7. **No ATS exceptions or extra networking capabilities.** No `NSAppTransportSecurity` exceptions are declared in `Info.plist`, and no additional networking-related entitlements or feature code paths are compiled in for builds where this optional download feature is disabled.
 
 ### 4.4 Telemetry, Logging, and Analytics
 
@@ -421,8 +426,8 @@ Stored in a **separate** `favorites.sqlite` file (Application Support), not in t
 -- No user identifiers, no device IDs, no PII of any kind.
 CREATE TABLE favorites (
     taxon_id    INTEGER PRIMARY KEY,   -- opaque species DB key; not a user identifier
-    created_at  TEXT NOT NULL          -- ISO-8601 UTC; used for "most recently added" ordering only
-        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    created_at  TEXT NOT NULL          -- ISO-8601 UTC with fractional seconds; used for "most recently added" ordering only
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- Supports ordered retrieval by recency.
@@ -882,7 +887,7 @@ macOS:      NavigationSplitView with three columns (tree / list / detail)
 - Taxonomy path (breadcrumb): Domain → … → Genus → **Species** (tappable).
 - Traits section (collapsible): key-value grid.
 - Synonyms & common names (grouped by language).
-- References (collapsible): citation list with optional URL (opened in-app with `SafariServices.SFSafariViewController` for iOS, or `NSWorkspace.open` for macOS).
+- References (collapsible): citation list with optional URL. **v1 behaviour:** URLs are displayed as text with a "Copy link" action only (no network access, no in-app browser). **Future (optional networking) milestone:** allow opening links in-app via `SafariServices.SFSafariViewController` on iOS or `NSWorkspace.open` on macOS when optional networking is explicitly enabled by the user.
 - Action buttons: "Compare with…", "Find closest relatives".
 
 ### 11.5 Compare View (`CompareView`)
@@ -985,15 +990,24 @@ distance(A, B) = (depth(A) − depth(LCA)) + (depth(B) − depth(LCA))
 
 **On-demand fallback (no precomputed tour):**
 
-```swift
-func lca(a: TaxonID, b: TaxonID) async throws -> Taxon {
-    var ancestorsA = try await ancestors(of: a)   // root → a
-    var ancestorsB = Set(try await ancestors(of: b).map(\.id))
-    for ancestor in ancestorsA.reversed() {
-        if ancestorsB.contains(ancestor.id) { return ancestor }
-    }
-    throw CompareError.noCommonAncestor
-}
+```
+// ancestors(of:) returns the path from root up to (but not including) the taxon itself.
+ancestorsA ← ancestors(of: a)   // root → parent(a)
+ancestorsB ← ancestors(of: b)   // root → parent(b)
+
+ancestorIDsA ← Set of IDs in ancestorsA
+ancestorIDsB ← Set of IDs in ancestorsB
+
+// If one taxon is a direct ancestor of the other, that taxon IS the LCA.
+if ancestorIDsB contains a  → return taxon(a)
+if ancestorIDsA contains b  → return taxon(b)
+
+// Otherwise walk ancestorsA from deepest to root, returning the
+// first node whose ID appears in ancestorIDsB.
+for ancestor in ancestorsA (reversed, deepest first):
+    if ancestorIDsB contains ancestor.id → return ancestor
+
+throw CompareError.noCommonAncestor   // should be unreachable in a well-formed tree
 ```
 
 ### 12.2 Trait-Based Similarity (Optional)
@@ -1214,282 +1228,66 @@ External deps (STOLData only):
 | Setting | iOS Target | macOS Target |
 |---|---|---|
 | `ENABLE_APP_SANDBOX` | YES (default) | YES |
-| `com.apple.security.network.client` | **absent** | **absent** |
-| `com.apple.security.network.server` | **absent** | **absent** |
+| `com.apple.security.network.client` | *n/a — iOS sandbox handles this differently* | **absent** |
+| `com.apple.security.network.server` | *n/a* | **absent** |
 | `SWIFT_STRICT_CONCURRENCY` | `complete` | `complete` |
 | `SWIFT_VERSION` | 6.0 | 6.0 |
 | Deployment target | iOS 17+ | macOS 14+ |
 | `DEBUG_INFORMATION_FORMAT` | `dwarf-with-dsym` | `dwarf-with-dsym` |
 
-Network entitlements are **absent** from the entitlements file for v1. They are added only when the optional reference DB download feature is implemented (v1.1+), behind a compile-time feature flag.
+For v1, **no macOS network sandbox entitlements** (`com.apple.security.network.client`, `com.apple.security.network.server`) are requested. They are added only when the optional reference DB download feature is implemented (v1.1+), behind a compile-time feature flag. On iOS, networking behaviour is governed by App Transport Security settings and the absence of networking code paths — there is no user-granted network permission to request.
 
-### 15.4 Minimal Code Stubs
+### 15.4 Package Implementation Responsibilities
 
-The following stubs live in their respective packages. They define the contract; implementations are filled in during development.
+Each Swift Package has a clearly bounded set of responsibilities. Implementation details are deferred to the coding phase; this section describes the contract each package must satisfy.
 
-**`STOLData/Sources/STOLData/DatabaseActor.swift`**
+**`STOLData`**
 
-```swift
-import Foundation
+- Owns the `DatabaseActor`: a Swift actor that serialises all SQLite access and holds two optional connection references (bundled read-only; reference read-only). All other packages access data exclusively through this actor.
+- Owns all shared model types (`Taxon`, `TaxonRank`, `TaxonID`, `TaxonName`, `Trait`, `TaxonReference`, `FavouriteEntry`, etc.).
+- Owns the `DatabaseProvider`, `TaxonomyStore`, and `ImportService` protocols.
+- Manages schema-version checking; refuses to open a DB whose schema version is ahead of what the current build understands.
+- Must compile on both iOS and macOS with Swift strict concurrency enabled.
 
-/// Actor that serializes all database access.
-public actor DatabaseActor {
-    private var bundledDB: DatabaseQueue   // GRDB.swift DatabaseQueue (SQLite connection pool)
-    private var referenceDB: DatabaseQueue?
+**`STOLSearch`**
 
-    public init(bundledURL: URL) throws {
-        self.bundledDB = try DatabaseQueue(path: bundledURL.path, configuration: .readOnly)
-    }
+- Owns `SearchService` protocol and its implementation.
+- Drives FTS5 queries through the `DatabaseActor` injected at construction time.
+- No direct SQLite file access; all DB work goes through `STOLData`.
 
-    public func read<T: Sendable>(
-        _ block: @Sendable (Database) throws -> T
-    ) throws -> T {
-        let activeDB = referenceDB ?? bundledDB
-        return try activeDB.read(block)
-    }
-}
-```
+**`STOLCompare`**
 
-**`STOLData/Sources/STOLData/TaxonomyStoreImpl.swift`**
+- Owns `CompareService`, `LCAEngine`, and `CompareConfig`.
+- `LCAEngine` builds an in-memory Euler-tour + sparse-table structure at startup (see §12.1). It receives the full taxon tree via `TaxonomyStore.children` traversal.
+- For trees too large to fit in memory, falls back to on-demand path-to-root LCA (see §12.1 on-demand fallback pseudocode for the required ancestor-of-ancestor handling).
+- All DB reads go through `DatabaseActor`.
 
-```swift
-import Foundation
+**`STOLMedia`**
 
-public final class TaxonomyStoreImpl: TaxonomyStore {
-    private let db: DatabaseActor
-    public init(db: DatabaseActor) { self.db = db }
+- Owns `MediaCache` protocol and `MediaCacheActor`.
+- Serves images from the app bundle or optional installed media packs in Application Support.
+- Exposes storage-size reporting and per-pack deletion for use by `SettingsView`.
 
-    public func taxon(id: TaxonID) async throws -> Taxon? {
-        try await db.read { db in
-            // SELECT * FROM taxa WHERE id = ?
-            fatalError("stub – implement with GRDB")
-        }
-    }
-    // … other methods
-}
-```
+**`STOLImport`**
 
-**`STOLCompare/Sources/STOLCompare/LCAEngine.swift`**
+- Owns `ImportService` and the atomic-import flow (copy → SHA-256 → Ed25519 → decompress → schema check → integrity check → atomic rename).
+- Exposes an `AsyncStream<ImportProgress>` for progress reporting to the UI.
+- On any validation failure: cleans up all temp files and throws a typed `ImportError`; never touches the active DB.
 
-```swift
-import STOLData
+**`STOLFavorites`**
 
-/// Computes Lowest Common Ancestor using an in-memory Euler tour + sparse table.
-public actor LCAEngine {
-    private var eulerTour: [TaxonID] = []
-    private var depth: [Int] = []
-    private var firstOccurrence: [TaxonID: Int] = [:]
-    private var sparseTable: [[Int]] = []   // sparse table over depth indices
+- Owns `FavoritesService` protocol and its actor-based implementation.
+- Maintains its own `favorites.sqlite` in `<Application Support>/Favorites/` — entirely separate from taxonomy DBs.
+- Keeps an in-memory `Set<TaxonID>` cache warm for O(1) `isFavourite` checks.
+- All mutations (add, remove, clear) update both the cache and the DB atomically.
+- Uses fractional-second ISO-8601 timestamps (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`) to guarantee stable "most recently added" ordering even when multiple favourites are added in rapid succession.
+- See `docs/design/Favorites.md` for the full feature spec.
 
-    public func build(from store: TaxonomyStore) async throws {
-        fatalError("stub – implement DFS + sparse table build")
-    }
+**`STOLSharedUI`**
 
-    public func lca(a: TaxonID, b: TaxonID) -> TaxonID {
-        fatalError("stub – implement RMQ query")
-    }
-
-    public func distance(a: TaxonID, b: TaxonID) -> Int {
-        fatalError("stub – implement depth(a) + depth(b) - 2*depth(lca(a,b))")
-    }
-}
-```
-
-**`STOLCompare/Sources/STOLCompare/CompareServiceImpl.swift`**
-
-```swift
-import STOLData
-
-public final class CompareServiceImpl: CompareService {
-    private let store: TaxonomyStore
-    private let lcaEngine: LCAEngine
-    private let db: DatabaseActor
-    public var config: CompareConfig = .init()
-
-    public init(store: TaxonomyStore, lcaEngine: LCAEngine, db: DatabaseActor) {
-        self.store = store
-        self.lcaEngine = lcaEngine
-        self.db = db
-    }
-
-    public func compare(taxonA: TaxonID, taxonB: TaxonID) async throws -> ComparisonResult {
-        fatalError("stub – implement using lcaEngine")
-    }
-
-    public func topNRelatives(
-        of taxonID: TaxonID,
-        n: Int,
-        source: TopNSource
-    ) async throws -> [RelativeResult] {
-        switch source {
-        case .precomputed:
-            return try await fetchPrecomputed(taxonID: taxonID, n: n)
-        case .computed(let maxCandidates):
-            return try await computeOnTheFly(taxonID: taxonID, n: n, max: maxCandidates)
-        }
-    }
-
-    private func fetchPrecomputed(taxonID: TaxonID, n: Int) async throws -> [RelativeResult] {
-        fatalError("stub – SELECT from top_n_relatives WHERE taxon_id = ? LIMIT n")
-    }
-
-    private func computeOnTheFly(taxonID: TaxonID, n: Int, max: Int) async throws -> [RelativeResult] {
-        fatalError("stub – BFS outward from taxon through taxonomy tree")
-    }
-}
-```
-
-**`STOLImport/Sources/STOLImport/ImportServiceImpl.swift`**
-
-```swift
-import CryptoKit
-import Foundation
-import STOLData
-
-public final class ImportServiceImpl: ImportService {
-    private let dbActor: DatabaseActor
-    private static let publicKey = /* Ed25519 public key bytes, hardcoded */ Data()
-
-    public init(dbActor: DatabaseActor) { self.dbActor = dbActor }
-
-    public func importReferenceDB(from url: URL) async throws {
-        // 1. Copy to tmp
-        // 2. Verify SHA-256
-        // 3. Verify Ed25519 signature using CryptoKit
-        // 4. Decompress
-        // 5. Open + verify schema_version
-        // 6. PRAGMA integrity_check
-        // 7. Atomic rename to Application Support
-        fatalError("stub")
-    }
-
-    public func cancelImport() async { fatalError("stub") }
-    public var progress: AsyncStream<ImportProgress> { fatalError("stub") }
-}
-```
-
-**`STOLFavorites/Sources/STOLFavorites/FavoritesServiceImpl.swift`**
-
-```swift
-import Foundation
-import STOLData
-
-/// Privacy-safe, local-only favourites storage.
-///
-/// Uses a dedicated GRDB DatabaseQueue backed by favorites.sqlite in Application Support.
-/// The only data stored is (taxon_id INTEGER, created_at TEXT). No PII is stored or derivable.
-public actor FavoritesServiceImpl: FavoritesService {
-
-    // MARK: - Private state
-
-    private let db: DatabaseQueue   // GRDB.swift DatabaseQueue (favorites.sqlite)
-
-    // In-memory set for O(1) isFavourite checks without hitting disk.
-    private var cachedIDs: Set<TaxonID> = []
-
-    // MARK: - Initialisation
-
-    public init(appSupportURL: URL) throws {
-        let dir = appSupportURL.appendingPathComponent("Favorites", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dbURL = dir.appendingPathComponent("favorites.sqlite")
-        self.db = try DatabaseQueue(path: dbURL.path)
-        try db.write { db in
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS favorites (
-                    taxon_id    INTEGER PRIMARY KEY,
-                    created_at  TEXT NOT NULL
-                        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                );
-                CREATE INDEX IF NOT EXISTS idx_favorites_created
-                    ON favorites(created_at DESC);
-                """)
-        }
-        // Warm the in-memory cache.
-        let ids = try db.read { db in
-            try Int64.fetchAll(db, sql: "SELECT taxon_id FROM favorites")
-        }
-        self.cachedIDs = Set(ids)
-    }
-
-    // MARK: - FavoritesService
-
-    public func isFavourite(taxonID: TaxonID) -> Bool {
-        cachedIDs.contains(taxonID)
-    }
-
-    public func addFavourite(taxonID: TaxonID) throws {
-        guard !cachedIDs.contains(taxonID) else { return }
-        try db.write { db in
-            try db.execute(
-                sql: "INSERT OR IGNORE INTO favorites (taxon_id) VALUES (?)",
-                arguments: [taxonID]
-            )
-        }
-        cachedIDs.insert(taxonID)
-    }
-
-    public func removeFavourite(taxonID: TaxonID) throws {
-        guard cachedIDs.contains(taxonID) else { return }
-        try db.write { db in
-            try db.execute(
-                sql: "DELETE FROM favorites WHERE taxon_id = ?",
-                arguments: [taxonID]
-            )
-        }
-        cachedIDs.remove(taxonID)
-    }
-
-    @discardableResult
-    public func toggleFavourite(taxonID: TaxonID) throws -> Bool {
-        if cachedIDs.contains(taxonID) {
-            try removeFavourite(taxonID: taxonID)
-            return false
-        } else {
-            try addFavourite(taxonID: taxonID)
-            return true
-        }
-    }
-
-    public func allFavourites() throws -> [FavouriteEntry] {
-        try db.read { db in
-            // Fetch rows ordered by most recently added first.
-            // No PII in the result: only taxon IDs and timestamps.
-            let rows = try Row.fetchAll(db, sql: """
-                SELECT taxon_id, created_at
-                  FROM favorites
-                 ORDER BY created_at DESC
-                """)
-            return rows.compactMap { row -> FavouriteEntry? in
-                guard let id: TaxonID = row["taxon_id"],
-                      let iso: String = row["created_at"],
-                      let date = ISO8601DateFormatter().date(from: iso)
-                else { return nil }
-                return FavouriteEntry(taxonID: id, createdAt: date)
-            }
-        }
-    }
-
-    public func favouritesCount() throws -> Int {
-        cachedIDs.count
-    }
-
-    public func clearAllFavourites() throws {
-        try db.write { db in
-            try db.execute(sql: "DELETE FROM favorites")
-        }
-        cachedIDs.removeAll()
-    }
-
-    public func storageBytes() throws -> Int64 {
-        try db.read { db in
-            let pageCount = try Int64.fetchOne(db, sql: "PRAGMA page_count") ?? 0
-            let pageSize  = try Int64.fetchOne(db, sql: "PRAGMA page_size")  ?? 4096
-            return pageCount * pageSize
-        }
-    }
-}
-```
+- Owns all SwiftUI views listed in §11. Imports only the protocol types from other packages (never concrete implementations).
+- Uses `#if os(iOS)` / `#if os(macOS)` for the small number of platform-specific idioms (navigation column count, share-sheet APIs, window management).
+- Never instantiates service implementations directly; receives them via the DI container at app startup.
 
 ---
 

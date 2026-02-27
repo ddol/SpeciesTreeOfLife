@@ -986,7 +986,7 @@ distance(A, B) = (depth(A) − depth(LCA)) + (depth(B) − depth(LCA))
 4. **LCA query:** `LCA(u, v)` → look up `first[u]`, `first[v]`, query sparse table for min-depth position in that range, return the node at that position.
 5. **Distance query:** O(1) after O(N log N) build.
 
-**Memory estimate:** For 500 k taxa, the tour has ~1 M entries. At 8 bytes per entry (Int64 node ID + Int32 depth), that is ~8 MB — acceptable for devices with ≥ 2 GB RAM. For trees > 1 M nodes, use the on-demand path-to-root approach (O(depth) per query, typically ≤ 20 hops).
+**Memory estimate:** For 500 k taxa, the tour has ~1 M entries. A logical payload of `Int64 nodeID + Int32 depth` is ≥ 12 bytes and will typically be padded to 16 bytes per entry in Swift, plus `Array`/sparse-table overhead. Conservatively budgeting ~20–30 MB of RAM for the Euler tour + depth + sparse table is reasonable on devices with ≥ 2 GB RAM. For trees > 1 M nodes (or on lower-memory devices), use the on-demand path-to-root approach (O(depth) per query, typically ≤ 20 hops).
 
 **On-demand fallback (no precomputed tour):**
 
